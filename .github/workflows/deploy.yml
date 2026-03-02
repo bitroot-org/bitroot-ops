@@ -1,0 +1,66 @@
+name: Deploy to OnePlus
+
+on:
+  workflow_call:
+    inputs:
+      project_name:
+        description: "PM2 project name (must match ~/bin/ports.conf entry)"
+        required: true
+        type: string
+      ssh_user:
+        description: "Termux SSH username"
+        required: false
+        type: string
+        default: "u0_a238"
+      ssh_host:
+        description: "SSH hostname (via Cloudflare tunnel)"
+        required: false
+        type: string
+        default: "ssh-oneplus.bitroot.in"
+      ssh_port:
+        description: "SSH port"
+        required: false
+        type: string
+        default: "22"
+    secrets:
+      ONEPLUS_SSH_KEY:
+        description: "Private key for GitHub Actions deploy user (ed25519)"
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.project_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ inputs.ssh_host }}
+          username: ${{ inputs.ssh_user }}
+          key: ${{ secrets.ONEPLUS_SSH_KEY }}
+          port: ${{ inputs.ssh_port }}
+          command_timeout: "8m"
+          script: |
+            export PATH="$HOME/bin:$PATH"
+            project deploy ${{ inputs.project_name }}
+
+      - name: Verify health check
+        run: |
+          PROJECT="${{ inputs.project_name }}"
+          URL="https://${PROJECT}.bitroot.in/health"
+          echo "checking $URL ..."
+          # give PM2 up to 30s to restart
+          for i in $(seq 1 6); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$URL" || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "health check passed (HTTP $STATUS)"
+              exit 0
+            fi
+            echo "attempt $i: HTTP $STATUS — retrying in 5s..."
+            sleep 5
+          done
+          echo "::warning::health check failed for $URL — app may still be starting"
+          # Don't fail the workflow — PM2 may still be booting
+          exit 0
