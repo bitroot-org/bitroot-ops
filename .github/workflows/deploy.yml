@@ -13,18 +13,19 @@ on:
         type: string
         default: "u0_a238"
       ssh_host:
-        description: "SSH hostname (via Cloudflare tunnel)"
+        description: "SSH hostname (Cloudflare tunnel)"
         required: false
         type: string
         default: "ssh-oneplus.bitroot.in"
-      ssh_port:
-        description: "SSH port"
-        required: false
-        type: string
-        default: "22"
     secrets:
       ONEPLUS_SSH_KEY:
-        description: "Private key for GitHub Actions deploy user (ed25519)"
+        description: "ed25519 private key for the deploy user"
+        required: true
+      CF_ACCESS_CLIENT_ID:
+        description: "Cloudflare Access service token client ID"
+        required: true
+      CF_ACCESS_CLIENT_SECRET:
+        description: "Cloudflare Access service token client secret"
         required: true
 
 jobs:
@@ -34,24 +35,51 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | \
+            sudo tee /usr/share/keyrings/cloudflare-main.gpg > /dev/null
+          echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared focal main' | \
+            sudo tee /etc/apt/sources.list.d/cloudflared.list
+          sudo apt-get update -qq && sudo apt-get install -y cloudflared
+
+      - name: Configure SSH via Cloudflare Access
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # Write deploy private key
+          echo "${{ secrets.ONEPLUS_SSH_KEY }}" > ~/.ssh/oneplus-deploy-key
+          chmod 600 ~/.ssh/oneplus-deploy-key
+
+          # SSH config: route through cloudflared with service token auth
+          cat >> ~/.ssh/config << 'EOF'
+          Host ssh-oneplus.bitroot.in
+            StrictHostKeyChecking no
+            IdentityFile ~/.ssh/oneplus-deploy-key
+            ProxyCommand cloudflared access ssh --hostname %h
+          EOF
+          chmod 600 ~/.ssh/config
+
+        env:
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+
       - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ inputs.ssh_host }}
-          username: ${{ inputs.ssh_user }}
-          key: ${{ secrets.ONEPLUS_SSH_KEY }}
-          port: ${{ inputs.ssh_port }}
-          command_timeout: "8m"
-          script: |
-            export PATH="$HOME/bin:$PATH"
-            project deploy ${{ inputs.project_name }}
+        run: |
+          ssh \
+            -o ConnectTimeout=30 \
+            ${{ inputs.ssh_user }}@${{ inputs.ssh_host }} \
+            "export PATH=\"\$HOME/bin:\$PATH\"; project deploy ${{ inputs.project_name }}"
+        env:
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
 
       - name: Verify health check
         run: |
           PROJECT="${{ inputs.project_name }}"
           URL="https://${PROJECT}.bitroot.in/health"
           echo "checking $URL ..."
-          # give PM2 up to 30s to restart
           for i in $(seq 1 6); do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$URL" || echo "000")
             if [ "$STATUS" = "200" ]; then
@@ -61,6 +89,5 @@ jobs:
             echo "attempt $i: HTTP $STATUS — retrying in 5s..."
             sleep 5
           done
-          echo "::warning::health check failed for $URL — app may still be starting"
-          # Don't fail the workflow — PM2 may still be booting
+          echo "::warning::health check at $URL not responding — app may still be starting"
           exit 0
